@@ -1,0 +1,272 @@
+---
+title: "Silberstein- stem cell screening"
+output:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_depth: 4
+    fig_caption: true
+    fig_width: 8
+    fig_height: 6
+author: "Meeta Mistry"
+---
+
+```{r setup, echo=FALSE}
+ 
+# Setup report details
+clientname="Myriam Armant"
+clientemail="myriam.armant@childrens.harvard.edu"
+lablocation="HSCI"
+analystname="Meeta Mistry"
+analystemail="mmistry@hsph.harvard.edu"
+```
+
+RNA-Seq analysis for `r clientname` (`r clientemail`) at `r lablocation`. Contact `r analystname` (`r analystemail`) for additional details. Request from client was:     
+
+Looking for concordance between microarray and RNASeq data. Dataset is composed of paired samples from four donors to evaluate the expression at two stages of limbal stem cell cultivation (treatment for LSCD):                        
+
+1. P0: secondary cell cultures on plastic dish
+2. AM: grafts released from plastic onto amniotic membrane
+
+
+## Workflow:   
+  * run BAM files through [bcbio](https://bcbio-nextgen.readthedocs.org/en/latest/index.html)
+  * [assess QC](./partek_aligned/qc-summary.html) 
+  * simple DEG list from Microarray data versus RNA-Seq
+  * for microarray analysis some help from [github](https://github.com/benilton/oligo/wiki/Getting-the-grips-with-the-oligo-Package)
+
+## Setup
+
+### Bioconductor and R libraries used
+
+```{r libraries, echo=TRUE}
+loadlibs <- function(){
+library(ggplot2)
+library(reshape)
+library(gplots)
+library(YuGene)
+library(arrayQualityMetrics)
+library(RColorBrewer)
+library(oligo)
+library(CHBUtils)
+library(ggdendro)
+library(grid)
+library(gridExtra)
+library(limma)
+library(DESeq2)
+library(Biobase)
+library(genefilter)
+library(splitstackshape)
+}
+suppressPackageStartupMessages(loadlibs())
+```
+
+### Set variables
+```{r directories, echo=TRUE}
+baseDir=getwd()
+resultsDir=paste(baseDir, "/results", sep="")
+
+heatcolors.1 <- rev(brewer.pal(6, "YlOrRd"))
+heatcolors.2 <- colorRampPalette(brewer.pal(9, "GnBu"))(100)
+cbPalette <- cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                            "#D55E00", "#CC79A7", "#000000")
+```
+
+## Microarray
+### Load data
+```{r load data, warning=FALSE, message=FALSE}
+
+# Load CEL files
+array.data <- read.celfiles(filenames=list.celfiles('./microarray', full.name=TRUE), verbose=FALSE)
+
+# Background correct aand normalize
+rma.data <- rma(array.data, target="core")
+
+# Add pheno data
+covars <- read.delim(file.path(baseDir, 'microarray/covars.desc'), row.names=1) 
+colnames(exprs(rma.data)) <- row.names(covars)
+pData(rma.data) <- covars
+pData(rma.data)$BAM_filenames <- NULL
+pData(rma.data)$Donors <- factor(pData(rma.data)$Donors)
+
+# Add annotation data
+library(annotate)
+library(hugene10sttranscriptcluster.db)
+annodb <- "hugene10sttranscriptcluster.db"
+ID     <- featureNames(rma.data)
+Symbol <- as.character(lookUp(ID, annodb, "SYMBOL"))
+Ensembl   <- as.character(lookUp(ID, annodb, "ENSEMBL"))
+Entrez <- as.character(lookUp(ID, annodb, "ENTREZID"))
+ann <- cbind(ID, Symbol, Ensembl, Entrez)
+
+fData(rma.data) <- data.frame(cbind(Symbol, Ensembl, Entrez), row.names=ID)
+```
+
+### QC Analysis
+The report for the raw data can be found here: [Raw QC](./results/report_raw/index.html). The report for normalized data can be found here: [RMA QC](./results/report_rma/index.html) According to the boxplot of intensity distributions in both the raw data and processed data sample 4B appears to be an outlier. Although from the PCA and dendrogram based on Euclidian distance - it seems more likely that Sample 5A is the outlier (figures below).
+
+```{r QC_report, echo=FALSE, eval=FALSE}
+# Raw data
+arrayQualityMetrics(expressionset=data, intgroup='Stage',
+                     outdir='./results/report_raw',
+                     force=TRUE,
+                    do.logtransform=TRUE)
+# Normalized data
+ arrayQualityMetrics(expressionset=rma.data, intgroup='Stage',
+                     outdir='./results/report_rma',
+                     force=TRUE,
+                    do.logtransform=FALSE)
+```
+
+```{r qcarray, echo=FALSE, fig.align='center', fig.width=18}
+# PCA plot of first and second PCs
+p1 <- mds(exprs(rma.data), k=length(colnames(rma.data)) - 1)
+
+
+# Dendrogram
+  meta.x <- pData(rma.data)
+  myDist <- dist(t(exprs(rma.data)))
+  myTree <-hclust(myDist)
+  dhc <- as.dendrogram(myTree)
+  ddata <- dendro_data(dhc, type="rectangle")
+  ddata$labels <- merge(ddata$labels, meta.x, by.x="label", by.y="row.names")
+p2 <- ggplot(segment(ddata)) +
+    geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+    theme_dendro() +
+    geom_text(data=label(ddata), aes(x=x, y=y, label=label, color= label(ddata)[['Stage']], 
+                                     hjust=-0.1), size=6) +
+    coord_flip() + scale_y_reverse(expand=c(0.2, 50)) +
+    theme(axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank(),
+          legend.title=element_blank())
+
+grid.arrange(p1, p2, ncol=2)
+```
+ 
+### Differential expression
+Looking at expression differences between the two stages P0 and AM we find zero genes that are differntially expressed. The p-value distribution indicates there are changes, but at an FDR < 0.1 six genes are identified and listed in the table below.
+```{r limma paired design, echo=TRUE, fig.align='center', results='asis'}
+
+# Remove outlier sample
+remove <- which(colnames(rma.data) == "MA_B3_5A.CEL")
+exprs(rma.data) <- exprs(rma.data)[,-remove]
+pData(rma.data) <- pData(rma.data)[-remove,]
+
+# Get model matrix
+mod <- model.matrix(~Stage + Donors, pData(rma.data))
+
+# Fit a linear model
+fit<-lmFit(rma.data, mod)
+fit2<-eBayes(fit)
+
+# Set threshold 
+p.cutoff <- 0.1
+logfc.cutoff <- 2
+
+gene_list <- topTable(fit2, coef=2, number=nrow(exprs(rma.data)), sort.by="logFC")
+
+# P-value Distribution
+hist(gene_list$P.Value, col="darkgrey", border=F, xlab="P-value", main="P-value Distribution")
+
+# Significant genes
+sigGenes <- gene_list[which(gene_list$adj.P.Val < p.cutoff), c('Symbol', 'logFC', 'P.Value', 'adj.P.Val')]
+sigGenes$P.Value <- formatC(sigGenes$P.Value, digits=3, format="e")
+kable(sigGenes, format='markdown', row.names=F)
+```
+
+## RNA-Seq (IonTorrent)
+### Load data
+
+```{r loadcounts}
+seq.data <- read.delim(file.path(baseDir, 'partek_aligned/htseq-count/combined.counts'), header=T, sep="\t",
+                       row.names=1, as.is=T) 
+seq.meta <- read.delim(file.path(baseDir, 'partek_aligned/covars.desc'), header=T, sep="\t")
+seq.meta$Donors <- factor(seq.meta$Donors)
+seq.meta <- seq.meta[which(rownames(seq.meta) %in% colnames(seq.data)),]
+seq.meta$BAM_filenames <- NULL
+```
+
+### Quality control
+Using the aligned BAM files from Partek Flow Server, several [summary plots](./partek_aligned/qc-summary.html) were used to evaluate the sample quality. We found that while almost half of the samples had a low mapping rate ( < 60%), the number of genes detected was roughly equal across all samples (~20,000).        
+
+We used [ht-seq](http://www-huber.embl.de/users/anders/HTSeq/doc/count.html) to generate a matrix of counts (mapped reads) for each feature (gene). Unlike the microarray data, the dendrogram below shows that the same samples assayed by IonTorrent sequencing do not cluster as well by Stage. Although the PCA plot identifies sample 5B as an outlier, similar to microarray findings.  
+```{r qcseq, echo=FALSE, fig.align='center', fig.width=22}
+# PCA plot of first and second PCs
+p1 <- mds(seq.data, k=length(colnames(seq.data)) - 1)
+
+# Dendrogram
+  meta.x <- seq.meta
+  myDist <- dist(t(seq.data))
+  myTree <-hclust(myDist)
+  dhc <- as.dendrogram(myTree)
+  ddata <- dendro_data(dhc, type="rectangle")
+  ddata$labels <- merge(ddata$labels, meta.x, by.x="label", by.y="row.names")
+p2 <- ggplot(segment(ddata)) +
+    geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+    theme_dendro() +
+    geom_text(data=label(ddata), aes(x=x, y=y, label=label, color= label(ddata)[['Stage']], 
+                                     hjust=-0.1), size=6) +
+    coord_flip() + scale_y_reverse(expand=c(0.2, 50)) +
+    theme(axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank(),
+          legend.title=element_blank())
+
+grid.arrange(p1, p2, ncol=2)
+```
+
+
+### Differential expression
+Contrary to microarray data, there appear to be 255 genes that are differntially expressed between the P0 stage and AM stage - alhtough the p-value distribution is a little unusual. The top genes are plotted in the heatmap below to visualize expression change both in the RNASeq dataset and in the array dataset.
+```{r deseq2, fig.align='center', message=FALSE}
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = seq.data, colData = seq.meta, design = ~ Donors + Stage)
+dds <- DESeq(dds)
+plotDispEsts(dds)
+
+# Contrasts automatically extracted for Stage
+res <- results(dds) 
+
+# P-value Distribution
+hist(res$pvalue, col="darkgrey", border=F, xlab="P-value", main="P-value Distribution")
+
+# Get significant genes from each comparison
+p.cutoff <- 0.05
+fc <- 2
+res$threshold <- as.logical(abs(res$log2FoldChange) > fc & res$padj < p.cutoff)
+
+# Matrix of pseudocounts for downstream visualization
+rld <- rlog(dds)
+
+# Plot example heatmap 
+ord.res <- res[order(res$padj),]
+select <- row.names(ord.res)[1:255]
+samples <- row.names(seq.meta)[order(rownames(seq.meta))]
+heatmap.2(assay(rld)[select, samples],scale="row", col=heatcolors.2, labRow="", Colv=FALSE, Rowv=FALSE,
+          trace="none", dendrogram="none", cexCol = 0.8)
+```
+
+### Visualization with array expression data
+From the array data, we see that the expression change is visible direction of change coincides. The question remains which of the results are more reliable.
+```{r arrayexp, fig.align='center', results='asis'}
+
+m <- match(select, fData(rma.data)$Ensembl, nomatch=NA)
+m <- m[!is.na(m)]
+exprs <- exprs(rma.data)[m,]
+samples <- row.names(pData(rma.data))[order(pData(rma.data)$Stage)]
+select.array <- match(select, row.names(exprs), nomatch=NA)
+heatmap.2(exprs[,samples],scale="row", col=heatcolors.2, labRow="", Colv=FALSE, Rowv=FALSE, 
+          trace="none", dendrogram="none", cexCol = 0.8)
+
+sigGenes <- gene_list[row.names(exprs)[1:10],]
+sigGenes$P.Value <- formatC(sigGenes$P.Value, digits=3, format="e")
+kable(sigGenes, format='markdown', row.names=F)
+```
+
+
+ 
+ 
