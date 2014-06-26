@@ -2,7 +2,7 @@
 title: "Silberstein- stem cell screening"
 output:
   html_document:
-    theme: cerulean
+    theme: cosmo
     toc: true
     toc_depth: 4
     fig_caption: true
@@ -44,7 +44,6 @@ loadlibs <- function(){
 library(ggplot2)
 library(reshape)
 library(gplots)
-library(YuGene)
 library(arrayQualityMetrics)
 library(RColorBrewer)
 library(oligo)
@@ -53,6 +52,7 @@ library(ggdendro)
 library(grid)
 library(gridExtra)
 library(limma)
+library(edgeR)
 library(DESeq2)
 library(Biobase)
 library(genefilter)
@@ -118,9 +118,9 @@ arrayQualityMetrics(expressionset=data, intgroup='Stage',
                     do.logtransform=FALSE)
 ```
 
-```{r qcarray, echo=FALSE, fig.align='center', fig.width=18}
+```{r qcarray, echo=FALSE, fig.align='center', fig.width=18, warning=FALSE, message=FALSE}
 # PCA plot of first and second PCs
-p1 <- mds(exprs(rma.data), k=length(colnames(rma.data)) - 1)
+p1 <- mds(exprs(rma.data), condition=pData(rma.data)$Stage , k=length(colnames(rma.data)) - 1)
 
 
 # Dendrogram
@@ -146,7 +146,7 @@ grid.arrange(p1, p2, ncol=2)
 ```
  
 ### Differential expression
-Looking at expression differences between the two stages P0 and AM we find zero genes that are differntially expressed. The p-value distribution indicates there are changes, but at an FDR < 0.1 six genes are identified and listed in the table below.
+Looking at expression differences between the two stages P0 and AM we find zero genes that are differntially expressed. The p-value distribution indicates there is a high frequency of low p-values, but at an FDR < 0.1 only six genes are identified and listed in the table below.
 ```{r limma paired design, echo=TRUE, fig.align='center', results='asis'}
 
 # Remove outlier sample
@@ -183,22 +183,26 @@ kable(sigGenes, format='markdown', row.names=F)
 seq.data <- read.delim(file.path(baseDir, 'partek_aligned/htseq-count/combined.counts'), header=T, sep="\t",
                        row.names=1, as.is=T) 
 seq.meta <- read.delim(file.path(baseDir, 'partek_aligned/covars.desc'), header=T, sep="\t")
-seq.meta$Donors <- factor(seq.meta$Donors)
 seq.meta <- seq.meta[which(rownames(seq.meta) %in% colnames(seq.data)),]
 seq.meta$BAM_filenames <- NULL
+seq.meta$Donors <- droplevels(factor(seq.meta$Donors))
 ```
 
 ### Quality control
 Using the aligned BAM files from Partek Flow Server, several [summary plots](./partek_aligned/qc-summary.html) were used to evaluate the sample quality. We found that while almost half of the samples had a low mapping rate ( < 60%), the number of genes detected was roughly equal across all samples (~20,000).        
 
-We used [ht-seq](http://www-huber.embl.de/users/anders/HTSeq/doc/count.html) to generate a matrix of counts (mapped reads) for each feature (gene). Unlike the microarray data, the dendrogram below shows that the same samples assayed by IonTorrent sequencing do not cluster as well by Stage. Although the PCA plot identifies sample 5B as an outlier, similar to microarray findings.  
-```{r qcseq, echo=FALSE, fig.align='center', fig.width=22}
+We used [ht-seq](http://www-huber.embl.de/users/anders/HTSeq/doc/count.html) to generate a matrix of counts (mapped reads) for each feature (gene). Similar to the microarray data, the dendrogram below shows that samples assayed by IonTorrent sequencing cluster by Stage with the exception of one sample (AM_donor4). 
+
+```{r qcseq, echo=FALSE, fig.align='center', fig.width=22, warning=FALSE, message=FALSE}
 # PCA plot of first and second PCs
-p1 <- mds(seq.data, k=length(colnames(seq.data)) - 1)
+dge <- DGEList(counts=seq.data)
+dge <- calcNormFactors(dge)
+normalized_counts = cpm(dge, normalized.lib.sizes=TRUE)
+p1 <- mds(normalized_counts, condition=seq.meta$Stage, k=length(colnames(seq.data)) - 1)
 
 # Dendrogram
   meta.x <- seq.meta
-  myDist <- dist(t(seq.data))
+  myDist <- dist(t(normalized_counts))
   myTree <-hclust(myDist)
   dhc <- as.dendrogram(myTree)
   ddata <- dendro_data(dhc, type="rectangle")
@@ -220,24 +224,127 @@ grid.arrange(p1, p2, ncol=2)
 
 
 ### Differential expression
-Contrary to microarray data, there appear to be 255 genes that are differntially expressed between the P0 stage and AM stage - alhtough the p-value distribution is a little unusual. The top genes are plotted in the heatmap below to visualize expression change both in the RNASeq dataset and in the array dataset.
-```{r deseq2, fig.align='center', message=FALSE}
+Using two methods (DESeq2 and edgeR) we evaluated the differential expression between the two stages. Each method generated a p-value distribution with a large proportion of high values (and somewhat oddly shaped for DESeq2). The total number of significant genes is much higher than microarray findings, but results are similar between the two methods. With the microarray data there is a higher frequency of 'low' p-values, but the lowest value is high in comparison to p-values generated from IonTorrent. This explains the larger number of significant genes at the same FDR.       
 
-# Create DESeq2 dataset
-dds <- DESeqDataSetFromMatrix(countData = seq.data, colData = seq.meta, design = ~ Donors + Stage)
-dds <- DESeq(dds)
-plotDispEsts(dds)
+```{r DE, fig.align='center', message=FALSE, echo=FALSE, results='asis', warning=FALSE, fig.height=9, fig.width=12}
 
-# Contrasts automatically extracted for Stage
-res <- results(dds) 
-
-# P-value Distribution
-hist(res$pvalue, col="darkgrey", border=F, xlab="P-value", main="P-value Distribution")
-
-# Get significant genes from each comparison
+# Set thresholds 
 p.cutoff <- 0.05
 fc <- 2
+
+# DESeq2
+dds <- DESeqDataSetFromMatrix(countData = seq.data, colData = seq.meta, design = ~ Donors + Stage)
+dds <- DESeq(dds)
+res <- results(dds) 
 res$threshold <- as.logical(abs(res$log2FoldChange) > fc & res$padj < p.cutoff)
+
+# edgeR
+yv <- DGEList(counts=seq.data, group=seq.meta$Stage)
+yv <- calcNormFactors(yv, method="TMM")
+mod  <- model.matrix(~Stage + Donors, seq.meta)
+
+# calculate dispersion
+dge <- estimateGLMCommonDisp(yv, mod)
+dge <- estimateGLMTrendedDisp(dge, mod)
+dge <- estimateGLMTagwiseDisp(dge, mod)
+fit <- glmFit(dge, mod)
+
+etable <- glmLRT(fit, coef="StageP0")
+res_edgeR <- topTags(etable, n=nrow(yv))$table
+res_edgeR$threshold <- as.logical(abs(res_edgeR$logFC) > fc & res_edgeR$FDR < p.cutoff)
+
+# Compare p-value distribution
+par(mfrow=c(2,2))
+hist(res$pvalue, col="darkgrey", border=F, xlab="P-value", main="DESeq2")
+hist(res_edgeR$PValue, col="darkgrey", border=F, xlab="P-value", main="edgeR")
+
+# Compare FC versus abundance
+with(res, plot(log2(baseMean), log2FoldChange, pch=20, main="DESeq2: Fold change vs abundance"))
+with(subset(res, padj< p.cutoff), points(log2(baseMean), log2FoldChange, pch=20, col="red"))
+abline(h=c(-2,2), col="blue")
+
+with(res_edgeR, plot(logCPM, logFC, pch=20, main="edgeR: Fold change vs abundance"))
+with(subset(res_edgeR, FDR< p.cutoff), points(logCPM, logFC, pch=20, col="red"))
+abline(h=c(-2,2), col="blue")
+
+sigDE <- c(length(which(res$threshold)), length(which(res_edgeR$threshold)), 
+           length(which(row.names(res)[which(res$threshold)] %in% row.names(res_edgeR)[which(res_edgeR$threshold)])))
+methods <- c("DESeq2", "edgeR", "Overlapping")
+sigDE <- data.frame(methods, "Genes"=sigDE)
+colnames(sigDE)[1] <- ""
+kable(sigDE, format='markdown', row.names=F)
+```
+
+### RNA-Seq versus Microarray
+Fold changes are much higher for RNA-Seq data compared to microarray. A good majority of the genes identified as significant ( FDR < 0.05) using DESeq2 have fold change < 1 in the microrarray data.
+```{r comparison, fig.align='center'}
+# take only probes with unique ensembl identifier
+mtable <- rma.data[which(fData(rma.data)$Ensembl %in% row.names(res)),]
+mtable <- mtable[which(!duplicated(fData(mtable)$Ensembl)),]
+res.table <- gene_list[row.names(exprs(mtable)),]
+
+# merge array and deseq2 results
+m <- match(fData(mtable)$Ensembl, row.names(res))
+merged <- merge(res.table, res[m,], by.x='Ensembl', by.y='row.names')
+
+# plot
+with(merged, plot(logFC, log2FoldChange, xlab="logFC Array", ylab="logFC DESeq", pch=20, 
+                  col="black", main="Array vs IonTorrent"))
+with(subset(merged, padj< 0.05),  points(logFC, log2FoldChange, xlab="logFC Array", 
+                                       ylab="logFC DESeq", pch=20, col="red"))
+with(subset(merged, adj.P.Val < 0.1), points(logFC, log2FoldChange, xlab="logFC Array", 
+                                       ylab="logFC DESeq", pch=20, col="green"))
+legend("topleft", xjust=1, yjust=1, legend=c("FDR<0.05 DESeq2", "FDR<0.1 Array", "FDR>0.05"), 
+       pch=20, col=c("red", "green", "black"), bty="n")
+ 
+```
+
+
+```{r compcodeR, eval=FALSE, echo=FALSE}
+# compcodeR
+require(compcodeR)
+info.parameters <- list(dataset = "armant_data", uID = "123456")
+colnames(seq.meta)[2] <- 'condition' 
+cpd <- compData(count.matrix = seq.data, sample.annotations = seq.meta, info.parameters = info.parameters)
+check_compData(cpd)
+saveRDS(cpd, "saveddata.rds")
+
+# run diff exp
+runDiffExp(data.file = "saveddata.rds", result.extent = "voom.limma", Rmdfunction = "voom.limma.createRmd", 
+           output.directory = "./compcodeR/", norm.method = "TMM")
+runDiffExp(data.file = "saveddata.rds", result.extent = "edgeR.exact", Rmdfunction = "edgeR.exact.createRmd", 
+           output.directory = "./compcodeR/", norm.method = "TMM", trend.method = "movingave", disp.type = "tagwise")
+runDiffExp(data.file = "saveddata.rds", result.extent = "ttest", Rmdfunction = "ttest.createRmd", 
+           output.directory = "./compcodeR/", norm.method = "TMM")
+
+# comparison
+file.table <- data.frame(input.files = c("./compcodeR//saveddata_edgeR.exact.rds",
+                                         "./compcodeR//saveddata_ttest.rds", 
+                                         "./compcodeR//saveddata_voom.limma.rds"), stringsAsFactors = FALSE)
+
+parameters <- list(incl.nbr.samples = NULL, incl.replicates = NULL, incl.dataset = "saveddata", incl.de.methods = NULL,
+                   fdr.threshold = 0.05, tpr.threshold = 0.05, typeI.threshold = 0.05, ma.threshold = 0.05, 
+                   fdc.maxvar = 1500, overlap.threshold = 0.05, fracsign.threshold = 0.05, 
+                   comparisons = c("auc", "fdr", "tpr", "ma", "correlation"))
+
+runComparison(file.table = file.table, parameters = parameters, output.directory = "./compcodeR/")
+
+
+```
+
+```{r voom, echo=FALSE, eval=FALSE}
+# voom limma
+mod  <- model.matrix(~Stage + Donors, seq.meta)
+v <- voom(dge, mod, plot=FALSE)
+
+fit <- lmFit(v, mod)
+fit <- eBayes(fit)
+res_voom <- topTable(fit, coef=2, number=nrow(seq.data), sort.by="p")
+res_voom$threshold <- as.logical(abs(res_voom$logFC) > fc & res_voom$adj.P.Val < p.cutoff)
+```
+
+
+```{r heatmap, fig.align='center', results='asis', eval=FALSE, echo=FALSE}
 
 # Matrix of pseudocounts for downstream visualization
 rld <- rlog(dds)
@@ -248,11 +355,6 @@ select <- row.names(ord.res)[1:255]
 samples <- row.names(seq.meta)[order(rownames(seq.meta))]
 heatmap.2(assay(rld)[select, samples],scale="row", col=heatcolors.2, labRow="", Colv=FALSE, Rowv=FALSE,
           trace="none", dendrogram="none", cexCol = 0.8)
-```
-
-### Visualization with array expression data
-From the array data, we see that the expression change is visible direction of change coincides. The question remains which of the results are more reliable.
-```{r arrayexp, fig.align='center', results='asis'}
 
 m <- match(select, fData(rma.data)$Ensembl, nomatch=NA)
 m <- m[!is.na(m)]
